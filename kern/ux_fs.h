@@ -8,16 +8,13 @@ extern struct file_operations ux_dir_operations;
 #define UX_DIRS_PER_BLOCK 16
 #define UX_DIRECT_BLOCKS  16
 #define UX_MAXFILES 32
-#define UX_MAXBLOCKS 470
+#define UX_MAXBLOCKS 1024
 #define UX_FIRST_DATA_BLOCK 50
 #define UX_BSIZE 512
 #define UX_BSIZE_BITS 9
 #define UX_MAGIC 0x58494e55
 #define UX_INODE_BLOCK 8
 #define UX_ROOT_NO 2
-
-//#define s_private u.generic_sbp
-//#define i_private u.generic_ip
 
 struct ux_superblock{
 	__u32 s_magic;
@@ -77,10 +74,7 @@ static inline struct uxfs_inode_info *UXFS_I(struct inode *inode)
 }
 
 extern ino_t ux_ialloc(struct super_block *);
-extern int ux_find_entry(struct inode *, char *);
+//extern struct buffer_head* ux_find_entry(struct inode *, char *, struct ux_dirent**);
 __u32 ux_block_alloc(struct super_block *);
-extern __u32 ux_block_alloc(struct super_block *);
-extern int ux_unlink(struct inode *, struct dentry *);
-extern int ux_link(struct dentry *, struct inode *, struct dentry *);
 
 #endif

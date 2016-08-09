@@ -10,51 +10,53 @@
 #include <linux/highuid.h>
 #include <linux/vfs.h>
 #include "ux_fs.h"
-#define AUFS_MAGIC 0x64668735
+
 
 static struct kmem_cache *uxfs_inode_cachep;
 
 static struct inode* ux_alloc_inode(struct super_block *sb)
 {
 	struct uxfs_inode_info* ui;
+	printk("ux_alloc_inode \n");
 	ui = kmem_cache_alloc(uxfs_inode_cachep, GFP_KERNEL);
 	if (!ui)
 		return NULL;
 	return &ui->vfs_inode; 
 }
 
-int ux_find_entry(struct inode *dip, char *name)
+static struct buffer_head* ux_find_entry(struct inode *dir, char *name, struct ux_dirent **res_dir)
 {
-	struct super_block *sb = dip->i_sb;
-	struct uxfs_inode_info *ui = UXFS_I(dip);
+	struct super_block *sb = dir->i_sb;
+	struct uxfs_inode_info *ui = UXFS_I(dir);
 	struct buffer_head *bh = NULL;
 	struct ux_dirent   *dirent;
 	int    i, blk = 0;
-
-	for (blk=0 ; blk < dip->i_blocks ; blk++) {
+	printk("ux_find_entry: name=%s\n", name);
+	for (blk=0 ; blk < dir->i_blocks ; blk++) {
 		bh = sb_bread(sb, ui->i_addr[blk]);
 		dirent = (struct ux_dirent *)bh->b_data;
-			for (i=0 ; i < UX_DIRS_PER_BLOCK ; i++) {
-				if (strcmp(dirent->d_name, name) == 0) {
-					brelse(bh);
-					return dirent->d_ino;
-				}
-				dirent++;
+		for (i=0 ; i < UX_DIRS_PER_BLOCK ; i++) {
+			if (strcmp(dirent->d_name, name) == 0) {
+				*res_dir = dirent;
+				return bh;
+			}
+			dirent++;
 		}
 	}
 
 	if (bh)
 		brelse(bh);
-	return 0;
+	return NULL;
 }
 
 void ux_read_inode(struct inode *inode)
 {
 	struct buffer_head	  *bh;
-	struct ux_inode		  *di;
+	struct ux_inode		  *ui;
 	unsigned long		  ino = inode->i_ino;
 	int			  block;
 
+	printk("ux_read_inode ino = %lu \n", ino);
 	if (ino < UX_ROOT_NO || ino > UX_MAXFILES) {
 		printk("uxfs: Bad inode number %lu\n", ino);
 		return;
@@ -72,65 +74,127 @@ void ux_read_inode(struct inode *inode)
 		return;
 	}
 
-	di = (struct ux_inode *)(bh->b_data);
-	inode->i_mode = di->i_mode;
-	if (di->i_mode & S_IFDIR) {
+	ui = (struct ux_inode *)(bh->b_data);
+
+	printk("ux_read_inode imode = %lu\n", (long unsigned int)ui->i_mode);
+	inode->i_mode = ui->i_mode;
+	if (ui->i_mode & S_IFDIR) {
 		inode->i_mode |= S_IFDIR;
 		inode->i_op = &ux_dir_inops;
 		inode->i_fop = &ux_dir_operations;
-	} else if (di->i_mode & S_IFREG) {
+	} else if (ui->i_mode & S_IFREG) {
 		inode->i_mode |= S_IFREG;
 		inode->i_op = &ux_file_inops;
 		inode->i_fop = &ux_file_operations;
 		inode->i_mapping->a_ops = &ux_aops;
 	}
-	i_uid_write(inode, le32_to_cpu(di->i_uid));
-	i_gid_write(inode, le32_to_cpu(di->i_gid));
-	set_nlink(inode, di->i_nlink);
-	inode->i_size = di->i_size;
-	inode->i_blocks = di->i_blocks;
+	
+	i_uid_write(inode, ui->i_uid);
+	i_gid_write(inode, ui->i_gid);
+	set_nlink(inode, ui->i_nlink);
+	printk("ui i_size = %u, ui i_blocks = %u\n", ui->i_size, ui->i_blocks);
+	
+	inode->i_size = ui->i_size;
+	inode->i_blocks = ui->i_blocks;
 	inode->i_blkbits = 9;
-	inode->i_atime.tv_sec = __le32_to_cpu(di->i_atime);
-	inode->i_mtime.tv_sec = __le32_to_cpu(di->i_mtime);
-	inode->i_ctime.tv_sec = __le32_to_cpu(di->i_ctime);
+	inode->i_atime.tv_sec = ui->i_atime;
+	inode->i_mtime.tv_sec = ui->i_mtime;
+	inode->i_ctime.tv_sec = ui->i_ctime;
+	printk("inode = %p\n", inode);
+	UXFS_I(inode)->i_blocks = ui->i_blocks;
+	memcpy(UXFS_I(inode)->i_addr, ui->i_addr, sizeof(ui->i_addr));
+	printk("ui blocks = %u\n", UXFS_I(inode)->i_blocks);
 	brelse(bh);
+}
+
+static struct ux_inode *find_inode(struct super_block* sb, u16 ino, struct buffer_head** p)
+{
+	printk("ux_find_inode %lu\n", (unsigned long)ino);
+	*p = sb_bread(sb, ino + UX_INODE_BLOCK); 
+	if (!*p)
+		printk("unable to read inode\n");
+	return (struct ux_inode*)((*p)->b_data);
 }
 
 static int ux_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	unsigned long ino = inode->i_ino;
-	struct ux_inode *uip = (struct ux_inode*)inode->i_private;
+	struct ux_inode *ui;
+	struct uxfs_inode_info *info = UXFS_I(inode);
 	struct buffer_head *bh;
 	__u32 blk;
 
-	printk("uxfs: ux_write_inode\n");
+	printk("uxfs: ux_write_inode, ino = %lu, inode->i_mode = %lu, isize = %d, blocks=%d, inodeblocks=%d\n", ino, (long unsigned int)inode->i_mode, (unsigned int)inode->i_size, (unsigned int)info->i_blocks, (int)inode->i_blocks);
 	if(ino < UX_ROOT_NO || ino > UX_MAXFILES){
 		printk("uxfs: Bad inode number %lu\n", ino);
 		return -1;
 	}
 	
+	ui = find_inode(inode->i_sb, inode->i_ino, &bh);
+	if (IS_ERR(ui))
+		return PTR_ERR(ui);
+	
 	blk = UX_INODE_BLOCK + ino;
-	bh = sb_bread(inode->i_sb, blk);
-	uip->i_mode = inode->i_mode;
-	uip->i_nlink = inode->i_nlink;
-	//uip->i_atime = inode->i_atime;
-	//uip->i_mtime = inode->i_mtime;
-	//uip->i_ctime = inode->i_ctime;
-	uip->i_uid = cpu_to_le32(i_uid_read(inode));
-	uip->i_gid = cpu_to_le32(i_gid_read(inode));
-	uip->i_size = cpu_to_le32(inode->i_size);
-	memcpy(bh->b_data, uip, sizeof(struct ux_inode));
+	ui->i_mode = inode->i_mode;
+	ui->i_nlink = inode->i_nlink;
+	ui->i_atime = inode->i_atime.tv_sec;
+	ui->i_mtime = inode->i_mtime.tv_sec;
+	ui->i_ctime = inode->i_ctime.tv_sec;
+	ui->i_uid = i_uid_read(inode);
+	ui->i_gid = i_gid_read(inode);
+	ui->i_size = inode->i_size;
+	ui->i_blocks = (ui->i_size + UX_BSIZE - 1)/UX_BSIZE;
+	memcpy(ui->i_addr, info->i_addr, sizeof(ui->i_addr));
+	memcpy(bh->b_data, ui, sizeof(struct ux_inode));
 	mark_buffer_dirty(bh);
 	brelse(bh);
 	return 0;
 }
 
+static void ux_evict_inode(struct inode *inode)
+{
+	struct buffer_head *bh;
+	struct ux_inode* ui;
+	struct super_block *sb = inode->i_sb;
+	struct ux_fs *info = (struct uxfs_fs_info*)sb->s_fs_info;
+	struct ux_superblock *usb = info->u_sb;
+	int i = 0;
+
+	printk("evict inode = %p, inode->i_nlink = %u inode->i_ino = %u\n", inode, inode->i_nlink, (unsigned int)inode->i_ino);
+	truncate_inode_pages_final(&inode->i_data);
+	invalidate_inode_buffers(inode);
+	clear_inode(inode);
+	
+	if (inode->i_nlink)
+		return;
+	
+	ui = find_inode(sb, inode->i_ino, &bh);
+	if (IS_ERR(ui))
+		return;
+
+	usb->s_nifree++;
+	usb->s_inode[inode->i_ino] = UX_INODE_FREE;	
+	for(i = 0; i < ui->i_blocks; i++){
+		usb->s_block[ui->i_addr[i] - UX_FIRST_DATA_BLOCK] = UX_BLOCK_FREE;
+		usb->s_nbfree++;
+	}
+	mark_buffer_dirty(info->u_sbh);
+
+	memset(ui, 0, sizeof(struct ux_inode));
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
+}
+
 void ux_put_super(struct super_block* s)
 {
 	struct ux_fs *fs = (struct ux_fs*)s->s_fs_info;
-	struct buffer_head *bh = fs->u_sbh;
+	if (!fs)
+		return;
+	brelse(fs->u_sbh);
+	printk("ux_put_super\n");
 	kfree(fs);
-	brelse(bh); 
+	s->s_fs_info = NULL;
 }
 
 int ux_statfs(struct dentry* dentry, struct kstatfs* buf)
@@ -194,6 +258,7 @@ struct super_operations uxfs_sops = {
 	.alloc_inode    = ux_alloc_inode,
 	.destroy_inode  = uxfs_destroy_inode,
 	.write_inode    = ux_write_inode,
+	.evict_inode    = ux_evict_inode,
 	.put_super      = ux_put_super,
 	.statfs         = ux_statfs
 };
@@ -209,7 +274,7 @@ static int ux_fill_super(struct super_block *s, void *data, int silent)
 
 	fs = (struct ux_fs*)kmalloc(sizeof(struct ux_fs), GFP_KERNEL);
 	if(!fs)
-	return -ENOMEM;
+		return -ENOMEM;
 
 	s->s_fs_info = fs;
 
@@ -248,7 +313,7 @@ static int ux_fill_super(struct super_block *s, void *data, int silent)
 	}
 
 	printk("got inode\n");
-	ux_read_inode(inode);	
+	ux_read_inode(inode);
 	
 	s->s_root = d_make_root(inode);
 	if(!s->s_root){
@@ -256,6 +321,8 @@ static int ux_fill_super(struct super_block *s, void *data, int silent)
 		goto out;
 	}
 
+	printk("s_root = %p\n", s->s_root);
+	unlock_new_inode(inode);
 	return 0;
 out:
 	return ret;
@@ -278,21 +345,24 @@ static struct file_system_type uxfs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "uxfs",
 	.mount = uxfs_domount,
-	.kill_sb = kill_litter_super,
+	.kill_sb = kill_block_super,
 	.fs_flags = FS_REQUIRES_DEV,
 };
+MODULE_ALIAS_FS("uxfs");
 
 static int __init init_uxfs_fs(void)
-{	
+{
 	int err = init_inodecache();
 	if (err)
 		goto out1;
 	err = register_filesystem(&uxfs_fs_type);
 	if (err)
 		goto out;
+	return 0;
 out:
 	destroy_inodecache();
 out1:
+	printk("error in init inodecache\n");
 	return err;
 }
 

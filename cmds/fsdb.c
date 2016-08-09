@@ -57,7 +57,7 @@ void print_inode(int inum, struct ux_inode *uip)
 
 int read_inode(int inum, struct ux_inode *uip)
 {
-	if(sb.s_inode[inum] == UX_INODE_FREE){
+	if(sb.s_inode[inum - 1] == UX_INODE_FREE){
 		printf("%dth node is free!\n", inum);
 		return -1;
 	}
