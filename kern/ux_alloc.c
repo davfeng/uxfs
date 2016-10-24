@@ -25,6 +25,7 @@ ino_t ux_ialloc(struct super_block *sb)
 		if (usb->s_inode[i] == UX_INODE_FREE) {
 			usb->s_inode[i] = UX_INODE_INUSE;
 			usb->s_nifree--;
+			usb->s_nbfree--;
 			return i;
 		}
 	}

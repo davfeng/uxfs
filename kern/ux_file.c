@@ -15,6 +15,7 @@ int ux_get_block(struct inode *inode, sector_t block, struct buffer_head *bh_res
 	struct super_block *sb = inode->i_sb;
 	struct uxfs_inode_info *ui = UXFS_I(inode);
 	int blk = 0;
+
 	/*
 	 * First check to see is the file can be extended.
 	 */
@@ -32,21 +33,27 @@ int ux_get_block(struct inode *inode, sector_t block, struct buffer_head *bh_res
 		return 0;
 	}
 	
-	/*
-	 * If we're creating we must allocate a new block.
-	 */
-	blk = ux_block_alloc(sb);
-	if (blk == 0){
-		printk("uxfs: ux_get_block - Out of space\n");
-		return -ENOSPC;
-	}
+	if(inode->i_size > 0){
+		
+		/*
+	 	* If we're creating we must allocate a new block.
+		* do not allocate blocks for empty file
+	 	*/
+		
+		blk = ux_block_alloc(sb);
+		if (blk == 0){
+			printk("uxfs: ux_get_block - Out of space\n");
+			return -ENOSPC;
+		}
 	
-	printk("uxfs: ux_get_block - blk = %u\n", (unsigned int)blk);
-	ui->i_addr[block] = blk;
-	ui->i_blocks++;
+		printk("uxfs: ux_get_block - blk = %u\n", (unsigned int)blk);
 
-	mark_inode_dirty(inode);
-	map_bh(bh_result, inode->i_sb, ui->i_addr[block]);
+		ui->i_addr[block] = blk;
+		ui->i_blocks++;	
+		mark_inode_dirty(inode);
+		map_bh(bh_result, inode->i_sb, ui->i_addr[block]);
+	}
+
 	return 0;
 }
 
@@ -83,6 +90,7 @@ int ux_write_begin(struct file *file, struct address_space *mapping, loff_t pos,
 
 static sector_t ux_bmap(struct address_space *mapping, sector_t block)
 {
+    printk("%s\n", __func__);
 	return generic_block_bmap(mapping, block, ux_get_block);
 }
 

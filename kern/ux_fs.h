@@ -76,5 +76,6 @@ static inline struct uxfs_inode_info *UXFS_I(struct inode *inode)
 extern ino_t ux_ialloc(struct super_block *);
 //extern struct buffer_head* ux_find_entry(struct inode *, char *, struct ux_dirent**);
 __u32 ux_block_alloc(struct super_block *);
-
+int ux_get_block(struct inode *inode, sector_t block, struct buffer_head *bh_result, int create);
+extern int ux_prepare_chunk(struct page *page, loff_t pos, unsigned len);
 #endif

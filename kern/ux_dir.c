@@ -4,6 +4,222 @@
 #include <linux/buffer_head.h>
 #include "ux_fs.h"
 
+static inline void dir_put_page(struct page *page)
+{
+	kunmap(page);
+	page_cache_release(page);
+}
+
+static unsigned ux_last_byte(struct inode *inode, unsigned long page_nr)
+{
+	unsigned last_byte = PAGE_CACHE_SIZE;
+
+	if (page_nr == (inode->i_size >> PAGE_CACHE_SHIFT))
+		last_byte = inode->i_size & (PAGE_CACHE_SIZE - 1);
+	return last_byte;
+}
+
+static int dir_commit_chunk(struct page *page, loff_t pos, unsigned len)
+{
+	struct address_space *mapping = page->mapping;
+	struct inode *dir = mapping->host;
+	int err = 0;
+	block_write_end(NULL, mapping, pos, len, len, page, NULL);
+
+	if (pos+len > dir->i_size) {
+		i_size_write(dir, pos+len);
+		mark_inode_dirty(dir);
+	}
+	if (IS_DIRSYNC(dir))
+		err = write_one_page(page, 1);
+	else
+		unlock_page(page);
+	return err;
+
+}
+
+static struct page *dir_get_page(struct inode *dir, unsigned long n)
+{
+	struct address_space *mapping = dir->i_mapping;
+	struct page *page = read_mapping_page(mapping, n, NULL);
+	if (!IS_ERR(page))
+		kmap(page);
+	return page;
+}
+
+static inline int namecompare(int len, int maxlen, const char *name, const char *buffer)
+{
+	if (len < maxlen && buffer[len])
+		return 0;
+	return !memcmp(name, buffer, len);
+}
+
+int ux_make_empty(struct inode *inode, struct inode *dir)
+{
+	struct page *page = grab_cache_page(inode->i_mapping, 0);
+	char *kaddr;
+	int err;
+	struct ux_dirent *de;
+
+	if (!page)
+		return -ENOMEM;
+	err = ux_prepare_chunk(page, 0, 2 * UX_DIRENT_SIZE);
+	if (err){
+		unlock_page(page);
+		goto fail;
+	}
+
+	kaddr = kmap_atomic(page);
+	memset(kaddr, 0, PAGE_CACHE_SIZE);
+
+	de = (struct ux_dirent*)kaddr;
+	de->d_ino = inode->i_ino;
+	strcpy(de->d_name, ".");
+
+	de = (struct ux_dirent*)((char*)de + UX_DIRENT_SIZE);
+	de->d_ino = dir->i_ino;
+	strcpy(de->d_name, "..");
+		
+	kunmap_atomic(kaddr);
+
+	err = dir_commit_chunk(page, 0, 2 * UX_DIRENT_SIZE);
+fail:
+	page_cache_release(page);
+	return err;	
+}
+
+int ux_add_link(struct dentry *dentry, struct inode *inode)
+{
+	struct inode *dir = d_inode(dentry->d_parent);
+	const char *name = dentry->d_name.name;
+	int namelen = dentry->d_name.len;
+	struct super_block *sb = dir->i_sb;
+	struct uxfs_inode_info *ui = UXFS_I(dir);
+	struct buffer_head *bh = NULL;
+	int    i, blk = 0;
+	int err;
+	char *namx = NULL;
+	__u32 inumber;
+	struct ux_dirent *de;
+
+	for (blk=0 ; blk < dir->i_blocks ; blk++) {
+		bh = sb_bread(sb, ui->i_addr[blk]);
+		de = (struct ux_dirent *)bh->b_data;
+
+		for (i=0 ; i < UX_DIRS_PER_BLOCK ; i++) {
+			namx = de->d_name;
+			inumber = de->d_ino;
+			if (i == UX_DIRS_PER_BLOCK - 1 && blk == dir->i_blocks - 1 ){
+				de->d_ino = 0;
+				goto got_it;
+			}
+			if (!inumber)
+				goto got_it;
+
+			err = -EEXIST;
+
+			if (namecompare(namelen, UX_NAMELEN, name, namx))
+				goto out_put; 
+			de++;
+		}
+	}
+
+	if (bh)
+		brelse(bh);
+	BUG();
+	return -EINVAL;
+
+got_it:
+	printk("memcpy!!!!\n");
+	memcpy (namx, name, namelen);
+	memset (namx + namelen, 0, UX_DIRENT_SIZE - namelen - 4);
+	de->d_ino = inode->i_ino;
+	dir->i_mtime = dir->i_ctime = CURRENT_TIME_SEC;
+	mark_inode_dirty(dir);
+	mark_buffer_dirty_inode(bh, dir);
+
+out_put:
+	if (bh)
+		brelse(bh);
+
+out:
+	return err;
+
+}
+/*
+int ux_add_link(struct dentry *dentry, struct inode *inode)
+{
+	struct inode *dir = d_inode(dentry->d_parent);
+	const char *name = dentry->d_name.name;
+	int namelen = dentry->d_name.len;
+	struct page *page = NULL;
+	unsigned long pages = dir_pages(dir);
+	unsigned long n;
+	char *kaddr, *p;
+	struct ux_dirent *de;
+	loff_t pos;
+	int err;
+	char *namx = NULL;
+	__u32 inumber;
+	printk("pages = %u\n", pages);
+	for(n = 0; n <= pages; n++){
+		char *limit, *dir_end;
+
+		printk("dir->i_mapping = %p\n", dir->i_mapping);
+		if (dir->i_mapping)
+			printk("dir->i_mapping->a_ops %p\n", dir->i_mapping->a_ops);
+		page = dir_get_page(dir, n);
+		printk("page = %p\n", page);
+		err = PTR_ERR(page);
+		if (IS_ERR(page))
+			goto out;
+		lock_page(page);
+		kaddr = (char*)page_address(page);
+		printk("kaddr = %p\n", kaddr);
+		dir_end = kaddr + ux_last_byte(dir, n);
+		limit = kaddr + PAGE_CACHE_SIZE - UX_DIRENT_SIZE;
+		for (p = kaddr; p <= limit; p += UX_DIRENT_SIZE){
+			de = (struct ux_dirent*)p;
+			namx = de->d_name;
+			inumber = de->d_ino;
+			if (p == dir_end ){
+				de->d_ino = 0;
+				goto got_it;
+			}
+			if (!inumber)
+				goto got_it;
+			err = -EEXIST;
+			if (namecompare(namelen, UX_NAMELEN, name, namx))
+				goto out_unlock; 
+		}
+		unlock_page(page);
+		dir_put_page(page);
+	}
+	BUG();
+	return -EINVAL;
+
+got_it:
+	pos = page_offset(page) + p - (char*)page_address(page);
+	err = ux_prepare_chunk(page, pos, UX_DIRENT_SIZE);
+	if (err)
+		goto out_unlock;
+	printk("memcpy!!!!\n");
+	memcpy (namx, name, namelen);
+	memset (namx + namelen, 0, UX_DIRENT_SIZE - namelen - 4);
+	de->d_ino = inode->i_ino;
+	err = dir_commit_chunk(page, pos, UX_DIRENT_SIZE);
+	dir->i_mtime = dir->i_ctime = CURRENT_TIME_SEC;
+	mark_inode_dirty(dir);
+out_put:
+	dir_put_page(page);
+out:
+	return err;
+out_unlock:
+	unlock_page(page);
+	goto out_put;
+}
+*/
+
 static struct buffer_head* ux_find_entry(struct inode *dir, const char *name, struct ux_dirent **res_dir)
 {
 	struct super_block *sb = dir->i_sb;
@@ -241,6 +457,7 @@ static struct dentry* ux_lookup(struct inode *dir, struct dentry *dentry, unsign
 			printk("folder!!!\n");
 			inode->i_op = &ux_dir_inops;
 			inode->i_fop = &ux_dir_operations;
+			inode->i_mapping->a_ops = &ux_aops;
 		}else if (ui->i_mode & S_IFREG){
 			printk("regular file!!!\n");
 			inode->i_op = &ux_file_inops;
@@ -384,12 +601,83 @@ end_rename:
 	return error;
 }
 
+static int ux_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct buffer_head *bh;
+	struct inode *inode;
+	struct ux_dirent* de;
+	ino_t inum;
+
+	printk("%s\n", __func__);
+	inode_inc_link_count(dir);
+	bh = ux_find_entry(dir, (char *)dentry->d_name.name, &de);
+	if (bh) {
+		brelse(bh);
+		return -EEXIST;
+	}
+	
+	inode = new_inode(dir->i_sb);
+	if (!inode) {
+		return -ENOSPC;
+	}
+
+	inum = ux_ialloc(dir->i_sb);
+	if (!inum) {
+		iput(inode);
+		return -ENOSPC;
+	}
+
+	printk("ux_create : inum = %d\n", (int)inum);
+	
+	/*
+	 * Increment the parent link count and intialize the inode.
+	 */
+
+	inode_init_owner(inode, dir, mode|S_IFDIR);
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME_SEC;
+	inode->i_blkbits = UX_BSIZE_BITS;
+	inode->i_blocks = 1;
+	inode->i_size = UX_BSIZE;
+	inode->i_op = &ux_file_inops;
+	inode->i_fop = &ux_file_operations;
+	inode->i_mapping->a_ops = &ux_aops;
+	inode->i_mode = mode|S_IFDIR;
+	inode->i_ino = inum;
+
+	inode->i_fop = &ux_dir_operations;
+	inode->i_op =  &ux_dir_inops;
+	inode->i_mapping->a_ops = &ux_aops;
+
+	insert_inode_hash(inode); 
+	mark_inode_dirty(inode);
+
+
+	inode_inc_link_count(inode);
+
+	ux_make_empty(inode, dir);
+	printk("%s:before ux_add_link\n", __func__);
+	ux_add_link(dentry, inode);
+	printk("%s:after ux_add_link\n", __func__);
+	d_instantiate(dentry, inode);
+
+	return 0;
+}
+
+static int ux_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	printk("%s\n", __func__);
+	return 0;
+}
+
+	
 struct inode_operations ux_dir_inops = {
 	.create = ux_create,
 	.lookup = ux_lookup,
 	.link   = ux_link,
 	.unlink = ux_unlink,
 	.rename = ux_rename,
+	.mkdir  = ux_mkdir,
+	.rmdir  = ux_rmdir,
 };
 
 

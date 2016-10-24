@@ -24,6 +24,11 @@ static struct inode* ux_alloc_inode(struct super_block *sb)
 	return &ui->vfs_inode; 
 }
 
+int ux_prepare_chunk(struct page *page, loff_t pos, unsigned len)
+{
+	return __block_write_begin(page, pos, len, ux_get_block);
+}
+
 static struct buffer_head* ux_find_entry(struct inode *dir, char *name, struct ux_dirent **res_dir)
 {
 	struct super_block *sb = dir->i_sb;
